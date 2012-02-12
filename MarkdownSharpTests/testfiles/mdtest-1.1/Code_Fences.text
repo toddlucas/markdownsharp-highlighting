@@ -1,0 +1,28 @@
+```
+code block on the first line
+```
+
+Regular text.
+```
+single line code block
+```
+Regular text.
+```
+the lines in this block  
+all contain trailing spaces  
+```
+Regular Text.
+```syntax
+single line code block
+```
+```
+back to back
+```
+```syntax
+back to back
+```
+```span at start of line```
+
+```
+code block on the last line
+```

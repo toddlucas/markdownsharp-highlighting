@@ -125,6 +125,10 @@ namespace MarkdownSharp
         public bool StrictBoldItalic { get; set; }
     }
 
+    public interface IMarkdownHighlighter
+    {
+        bool Highlight(string text, string syntax, out string highlighted);
+    }
 
     /// <summary>
     /// Markdown is a text-to-HTML conversion tool for web writers. 
@@ -266,6 +270,13 @@ namespace MarkdownSharp
         }
         private bool _encodeProblemUrlCharacters = false;
 
+        public IMarkdownHighlighter Highlighter
+        {
+            get { return _highlighter; }
+            set { _highlighter = value; }
+        }
+        private IMarkdownHighlighter _highlighter = null;
+
         #endregion
 
         private enum TokenType { Text, Tag }
@@ -378,6 +389,7 @@ namespace MarkdownSharp
             text = DoHeaders(text);
             text = DoHorizontalRules(text);
             text = DoLists(text);
+            text = DoCodeFences(text);
             text = DoCodeBlocks(text);
             text = DoBlockQuotes(text);
 
@@ -471,6 +483,42 @@ namespace MarkdownSharp
             return string.Join("\n\n", grafs);
         }
 
+        /// <summary>
+        /// Unhashes a block of text without wrapping in p tags.
+        /// Used for code blocks that must be highlighted.
+        /// </summary>
+        private string UnhashCodeBlock(string text)
+        {
+            // split on two or more newlines
+            string[] grafs = _newlinesMultiple.Split(_newlinesLeadingTrailing.Replace(text, ""));
+
+            for (int i = 0; i < grafs.Length; i++)
+            {
+                if (grafs[i].StartsWith("\x1AH"))
+                {
+                    int sanityCheck = 50; // just for safety, guard against an infinite loop
+                    bool keepGoing = true; // as long as replacements where made, keep going
+                    while (keepGoing && sanityCheck > 0)
+                    {
+                        keepGoing = false;
+                        grafs[i] = _htmlBlockHash.Replace(grafs[i], match =>
+                        {
+                            keepGoing = true;
+                            return _htmlBlocks[match.Value];
+                        });
+                        sanityCheck--;
+                    }
+                    /* if (keepGoing)
+                    {
+                        // Logging of an infinite loop goes here.
+                        // If such a thing should happen, please open a new issue on http://code.google.com/p/markdownsharp/
+                        // with the input that caused it.
+                    }*/
+                }
+            }
+
+            return string.Join("\n\n", grafs);
+        }
 
         private void Setup()
         {
@@ -1307,10 +1355,58 @@ namespace MarkdownSharp
         {
             string codeBlock = match.Groups[1].Value;
 
-            codeBlock = EncodeCode(Outdent(codeBlock));
-            codeBlock = _newlinesLeadingTrailing.Replace(codeBlock, "");
+            codeBlock = Outdent(codeBlock);
+            string highlighted;
+            if (HighlightCode(codeBlock, null, out highlighted))
+            {
+                codeBlock = EncodeHighlight(highlighted);
+                return string.Concat("\n\n<div>", codeBlock, "\n</div>\n\n");
+            } 
+            else
+            {
+                codeBlock = EncodeCode(codeBlock);
+                codeBlock = _newlinesLeadingTrailing.Replace(codeBlock, "");
+                return string.Concat("\n\n<pre><code>", codeBlock, "\n</code></pre>\n\n");
+            }
+        }
 
-            return string.Concat("\n\n<pre><code>", codeBlock, "\n</code></pre>\n\n");
+        private static Regex _codeFence = new Regex(@"
+                    (?:^```)
+                    (?![^\n]*```)   # Exclude spans that start at the beginning of the line
+                    ([^\n]*)        # $1 = optional syntax name
+                    (               # $2 = the code block -- one or more lines
+                        (?:
+                            .*\n
+                        )+?
+                    )
+                    (?:```)", RegexOptions.Multiline | RegexOptions.IgnorePatternWhitespace | RegexOptions.Compiled);
+
+        /// <summary>
+        /// Turn Markdown ```fenced``` code into HTML pre code blocks
+        /// </summary>
+        private string DoCodeFences(string text)
+        {
+            text = _codeFence.Replace(text, new MatchEvaluator(CodeFenceEvaluator));
+            return text;
+        }
+
+        private string CodeFenceEvaluator(Match match)
+        {
+            string syntax = (match.Groups[1].Value ?? String.Empty).Trim();
+            string codeBlock = match.Groups[2].Value;
+
+            string highlighted;
+            if (HighlightCode(codeBlock, syntax, out highlighted))
+            {
+                codeBlock = EncodeHighlight(highlighted);
+                return string.Concat("\n\n<div>", codeBlock, "\n</div>\n\n");
+            }
+            else
+            {
+                codeBlock = EncodeCode(codeBlock);
+                codeBlock = _newlinesLeadingTrailing.Replace(codeBlock, "");
+                return string.Concat("\n\n<pre><code>", codeBlock, "\n</code></pre>\n\n");
+            }
         }
 
         private static Regex _codeSpan = new Regex(@"
@@ -1536,6 +1632,17 @@ namespace MarkdownSharp
             return _outDent.Replace(block, "");
         }
 
+        private bool HighlightCode(string code, string syntax, out string highlighted)
+        {
+            highlighted = null;
+            if (_highlighter == null)
+                return false;
+
+            // Remove any HTML encoding so it can be highlighted.
+            code = UnhashCodeBlock(code);
+
+            return _highlighter.Highlight(code, syntax, out highlighted);
+        }
 
         #region Encoding and Normalization
 
@@ -1564,6 +1671,7 @@ namespace MarkdownSharp
         }
 
         private static Regex _codeEncoder = new Regex(@"&|<|>|\\|\*|_|\{|\}|\[|\]", RegexOptions.Compiled);
+        private static Regex _highlightEncoder = new Regex(@"\\|\*|_|\{|\}|\[|\]", RegexOptions.Compiled);
 
         /// <summary>
         /// Encode/escape certain Markdown characters inside code blocks and spans where they are literals
@@ -1589,6 +1697,20 @@ namespace MarkdownSharp
                 default:
                     return _escapeTable[match.Value];
             }
+        }
+
+        /// <summary>
+        /// Encode certain Markdown characters inside highlights,
+        /// where they are literals, while preserving HTML entities.
+        /// The highlighter must encode '<', '>', & '&'.
+        /// </summary>
+        private string EncodeHighlight(string code)
+        {
+            return _highlightEncoder.Replace(code, EncodeHighlightEvaluator);
+        }
+        private string EncodeHighlightEvaluator(Match match)
+        {
+            return _escapeTable[match.Value];
         }
 
 
